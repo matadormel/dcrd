@@ -201,6 +201,10 @@ type serverPeer struct {
 	banScore        connmgr.DynamicBanScore
 	quit            chan struct{}
 
+	// addrsSent tracks whether or not the peer has responded to a getaddr
+	// request.  It is used to prevent more than one response per connection.
+	addrsSent bool
+
 	// The following chans are used to sync blockmanager and server.
 	txProcessed    chan struct{}
 	blockProcessed chan struct{}
@@ -319,10 +323,83 @@ func (sp *serverPeer) addBanScore(persistent, transient uint32, reason string) {
 	}
 }
 
+// hasServices returns whether or not the provided advertised service flags have
+// all of the provided desired service flags set.
+func hasServices(advertised, desired wire.ServiceFlag) bool {
+	return advertised&desired == desired
+}
+
 // OnVersion is invoked when a peer receives a version wire message and is used
 // to negotiate the protocol version details as well as kick start the
 // communications.
-func (sp *serverPeer) OnVersion(p *peer.Peer, msg *wire.MsgVersion) {
+func (sp *serverPeer) OnVersion(p *peer.Peer, msg *wire.MsgVersion) *wire.MsgReject {
+	// Update the address manager with the advertised services for outbound
+	// connections in case they have changed.  This is not done for inbound
+	// connections to help prevent malicious behavior and is skipped when
+	// running on the simulation test network since it is only intended to
+	// connect to specified peers and actively avoids advertising and
+	// connecting to discovered peers.
+	//
+	// NOTE: This is done before rejecting peers that are too old to ensure
+	// it is updated regardless in the case a new minimum protocol version is
+	// enforced and the remote node has not upgraded yet.
+	isInbound := sp.Inbound()
+	remoteAddr := sp.NA()
+	addrManager := sp.server.addrManager
+	if !cfg.SimNet && !isInbound {
+		addrManager.SetServices(remoteAddr, msg.Services)
+	}
+
+	// Ignore peers that have a protcol version that is too old.  The peer
+	// negotiation logic will disconnect it after this callback returns.
+	if msg.ProtocolVersion < int32(wire.InitialProcotolVersion) {
+		return nil
+	}
+
+	// Reject outbound peers that are not full nodes.
+	wantServices := wire.SFNodeNetwork
+	if !isInbound && !hasServices(msg.Services, wantServices) {
+		missingServices := wantServices & ^msg.Services
+		srvrLog.Debugf("Rejecting peer %s with services %v due to not "+
+			"providing desired services %v", sp.Peer, msg.Services,
+			missingServices)
+		reason := fmt.Sprintf("required services %#x not offered",
+			uint64(missingServices))
+		return wire.NewMsgReject(msg.Command(), wire.RejectNonstandard, reason)
+	}
+
+	// Update the address manager and request known addresses from the
+	// remote peer for outbound connections.  This is skipped when running
+	// on the simulation test network since it is only intended to connect
+	// to specified peers and actively avoids advertising and connecting to
+	// discovered peers.
+	if !cfg.SimNet && !isInbound {
+		// Advertise the local address when the server accepts incoming
+		// connections and it believes itself to be close to the best
+		// known tip.
+		if !cfg.DisableListen && sp.server.blockManager.IsCurrent() {
+			// Get address that best matches.
+			lna := addrManager.GetBestLocalAddress(remoteAddr)
+			if addrmgr.IsRoutable(lna) {
+				// Filter addresses the peer already knows about.
+				addresses := []*wire.NetAddress{lna}
+				sp.pushAddrMsg(addresses)
+			}
+		}
+
+		// Request known addresses if the server address manager needs
+		// more.
+		if addrManager.NeedMoreAddresses() {
+			p.QueueMessage(wire.NewMsgGetAddr(), nil)
+		}
+
+		// Mark the address as a known good address.
+		addrManager.Good(remoteAddr)
+	}
+
+	// Choose whether or not to relay transactions.
+	sp.setDisableRelayTx(msg.DisableRelayTx)
+
 	// Add the remote peer time as a sample for creating an offset against
 	// the local clock to keep the network time in sync.
 	sp.server.timeSource.AddTimeSample(p.Addr(), msg.Timestamp)
@@ -330,43 +407,9 @@ func (sp *serverPeer) OnVersion(p *peer.Peer, msg *wire.MsgVersion) {
 	// Signal the block manager this peer is a new sync candidate.
 	sp.server.blockManager.NewPeer(sp)
 
-	// Choose whether or not to relay transactions.
-	sp.setDisableRelayTx(msg.DisableRelayTx)
-
-	// Update the address manager and request known addresses from the
-	// remote peer for outbound connections.  This is skipped when running
-	// on the simulation test network since it is only intended to connect
-	// to specified peers and actively avoids advertising and connecting to
-	// discovered peers.
-	if !cfg.SimNet {
-		addrManager := sp.server.addrManager
-		// Outbound connections.
-		if !p.Inbound() {
-			// TODO(davec): Only do this if not doing the initial block
-			// download and the local address is routable.
-			if !cfg.DisableListen /* && isCurrent? */ {
-				// Get address that best matches.
-				lna := addrManager.GetBestLocalAddress(p.NA())
-				if addrmgr.IsRoutable(lna) {
-					// Filter addresses the peer already knows about.
-					addresses := []*wire.NetAddress{lna}
-					sp.pushAddrMsg(addresses)
-				}
-			}
-
-			// Request known addresses if the server address manager
-			// needs more.
-			if addrManager.NeedMoreAddresses() {
-				p.QueueMessage(wire.NewMsgGetAddr(), nil)
-			}
-
-			// Mark the address as a known good address.
-			addrManager.Good(p.NA())
-		}
-	}
-
 	// Add valid peer to the server.
 	sp.server.AddPeer(sp)
+	return nil
 }
 
 // OnMemPool is invoked when a peer receives a mempool wire message.  It creates
@@ -678,46 +721,18 @@ func (sp *serverPeer) OnGetData(p *peer.Peer, msg *wire.MsgGetData) {
 
 // OnGetBlocks is invoked when a peer receives a getblocks wire message.
 func (sp *serverPeer) OnGetBlocks(p *peer.Peer, msg *wire.MsgGetBlocks) {
-	// Return all block hashes to the latest one (up to max per message) if
-	// no stop hash was specified.
-	// Attempt to find the ending index of the stop hash if specified.
-	chain := sp.server.blockManager.chain
-	endIdx := int64(math.MaxInt64)
-	if !msg.HashStop.IsEqual(&zeroHash) {
-		height, err := chain.BlockHeightByHash(&msg.HashStop)
-		if err == nil {
-			endIdx = height + 1
-		}
-	}
-
+	// Find the most recent known block in the best chain based on the block
+	// locator and fetch all of the block hashes after it until either
+	// wire.MaxBlocksPerMsg have been fetched or the provided stop hash is
+	// encountered.
+	//
 	// Find the most recent known block based on the block locator.
 	// Use the block after the genesis block if no other blocks in the
 	// provided locator are known.  This does mean the client will start
 	// over with the genesis block if unknown block locators are provided.
-	// This mirrors the behavior in the reference implementation.
-	startIdx := int64(1)
-	for _, hash := range msg.BlockLocatorHashes {
-		height, err := chain.BlockHeightByHash(hash)
-		if err == nil {
-			// Start with the next hash since we know this one.
-			startIdx = height + 1
-			break
-		}
-	}
-
-	// Don't attempt to fetch more than we can put into a single message.
-	autoContinue := false
-	if endIdx-startIdx > wire.MaxBlocksPerMsg {
-		endIdx = startIdx + wire.MaxBlocksPerMsg
-		autoContinue = true
-	}
-
-	// Fetch the inventory from the block database.
-	hashList, err := chain.HeightRange(startIdx, endIdx)
-	if err != nil {
-		peerLog.Warnf("Block lookup failed: %v", err)
-		return
-	}
+	chain := sp.server.blockManager.chain
+	hashList := chain.LocateBlocks(msg.BlockLocatorHashes, &msg.HashStop,
+		wire.MaxBlocksPerMsg)
 
 	// Generate inventory message.
 	invMsg := wire.NewMsgInv()
@@ -729,7 +744,7 @@ func (sp *serverPeer) OnGetBlocks(p *peer.Peer, msg *wire.MsgGetBlocks) {
 	// Send the inventory message if there is anything to send.
 	if len(invMsg.InvList) > 0 {
 		invListLen := len(invMsg.InvList)
-		if autoContinue && invListLen == wire.MaxBlocksPerMsg {
+		if invListLen == wire.MaxBlocksPerMsg {
 			// Intentionally use a copy of the final hash so there
 			// is not a reference into the inventory slice which
 			// would prevent the entire slice from being eligible
@@ -741,76 +756,6 @@ func (sp *serverPeer) OnGetBlocks(p *peer.Peer, msg *wire.MsgGetBlocks) {
 	}
 }
 
-// locateBlocks returns the hashes of the blocks after the first known block in
-// locators, until hashStop is reached, or up to a max of
-// wire.MaxBlockHeadersPerMsg block hashes.  This implements the search
-// algorithm used by getheaders.
-//
-// TODO: For efficiency this should take a []Hash, not []*Hash.  This requires
-// changing the representation of the wire.MsgGetHeaders to use a []Hash slice
-// for the block locators.
-func (s *server) locateBlocks(locators []*chainhash.Hash, hashStop *chainhash.Hash) ([]chainhash.Hash, error) {
-	// Attempt to look up the height of the provided stop hash.
-	chain := s.blockManager.chain
-	endIdx := int64(math.MaxInt64)
-	height, err := chain.BlockHeightByHash(hashStop)
-	if err == nil {
-		endIdx = height + 1
-	}
-
-	// There are no block locators so a specific header is being requested
-	// as identified by the stop hash.
-	if len(locators) == 0 {
-		// No blocks with the stop hash were found so there is nothing
-		// to do.  Just return.  This behavior mirrors the reference
-		// implementation.
-		if endIdx == math.MaxInt64 {
-			return nil, nil
-		}
-
-		return []chainhash.Hash{*hashStop}, nil
-	}
-
-	// Find the most recent known block based on the block locator.
-	// Use the block after the genesis block if no other blocks in the
-	// provided locator are known.  This does mean the client will start
-	// over with the genesis block if unknown block locators are provided.
-	// This mirrors the behavior in the reference implementation.
-	startIdx := int64(1)
-	for _, loc := range locators {
-		height, err := chain.BlockHeightByHash(loc)
-		if err == nil {
-			// Start with the next hash since we know this one.
-			startIdx = height + 1
-			break
-		}
-	}
-
-	// Don't attempt to fetch more than we can put into a single wire
-	// message.
-	if endIdx-startIdx > wire.MaxBlockHeadersPerMsg {
-		endIdx = startIdx + wire.MaxBlockHeadersPerMsg
-	}
-
-	// Fetch the inventory from the block database.
-	return chain.HeightRange(startIdx, endIdx)
-}
-
-// fetchHeaders fetches and decodes headers from the db for each hash in
-// blockHashes.
-func fetchHeaders(chain *blockchain.BlockChain, blockHashes []chainhash.Hash) ([]wire.BlockHeader, error) {
-	headers := make([]wire.BlockHeader, 0, len(blockHashes))
-	for i := range blockHashes {
-		header, err := chain.FetchHeader(&blockHashes[i])
-		if err != nil {
-			return nil, err
-		}
-		headers = append(headers, header)
-	}
-
-	return headers, nil
-}
-
 // OnGetHeaders is invoked when a peer receives a getheaders wire message.
 func (sp *serverPeer) OnGetHeaders(p *peer.Peer, msg *wire.MsgGetHeaders) {
 	// Ignore getheaders requests if not in sync.
@@ -818,28 +763,25 @@ func (sp *serverPeer) OnGetHeaders(p *peer.Peer, msg *wire.MsgGetHeaders) {
 		return
 	}
 
-	blockHashes, err := sp.server.locateBlocks(msg.BlockLocatorHashes,
-		&msg.HashStop)
-	if err != nil {
-		peerLog.Errorf("OnGetHeaders: failed to fetch hashes: %v", err)
+	// Find the most recent known block in the best chain based on the block
+	// locator and fetch all of the headers after it until either
+	// wire.MaxBlockHeadersPerMsg have been fetched or the provided stop
+	// hash is encountered.
+	//
+	// Use the block after the genesis block if no other blocks in the
+	// provided locator are known.  This does mean the client will start
+	// over with the genesis block if unknown block locators are provided.
+	chain := sp.server.blockManager.chain
+	headers := chain.LocateHeaders(msg.BlockLocatorHashes, &msg.HashStop)
+	if len(headers) == 0 {
+		// Nothing to send.
 		return
 	}
-	headers, err := fetchHeaders(sp.server.blockManager.chain, blockHashes)
-	if err != nil {
-		peerLog.Errorf("OnGetHeaders: failed to fetch block headers: "+
-			"%v", err)
-	}
+
+	// Send found headers to the requesting peer.
 	blockHeaders := make([]*wire.BlockHeader, len(headers))
 	for i := range headers {
 		blockHeaders[i] = &headers[i]
-	}
-
-	if len(blockHeaders) > wire.MaxBlockHeadersPerMsg {
-		peerLog.Warnf("OnGetHeaders: fetched more block headers than " +
-			"allowed per message")
-		// Can still recover from this error, just slice off the extra
-		// headers and continue queing the message.
-		blockHeaders = blockHeaders[:wire.MaxBlockHeaderPayload]
 	}
 	p.QueueMessage(&wire.MsgHeaders{Headers: blockHeaders}, nil)
 }
@@ -1115,6 +1057,14 @@ func (sp *serverPeer) OnGetAddr(p *peer.Peer, msg *wire.MsgGetAddr) {
 	if !p.Inbound() {
 		return
 	}
+
+	// Only respond with addresses once per connection.  This helps reduce
+	// traffic and further reduces fingerprinting attacks.
+	if sp.addrsSent {
+		peerLog.Tracef("Ignoring getaddr from %v - already sent", sp.Peer)
+		return
+	}
+	sp.addrsSent = true
 
 	// Get the current known addresses from the address manager.
 	addrCache := sp.server.addrManager.AddressCache()
